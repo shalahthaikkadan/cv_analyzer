@@ -17,26 +17,35 @@ Including another URLconf
 # core/urls.py
 from django.contrib import admin
 from django.urls import path, include
+
+# Add imports for media file serving
+from django.conf import settings
+from django.conf.urls.static import static
+
+# Import the view that serves your index.html
+from cv_analyzer.views import FrontendAppView
+
+# Import the specific views for JWT token handling
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
 )
-# Import both views from the cv_analyzer app
-from cv_analyzer.views import RegisterView, FrontendAppView
 
 urlpatterns = [
-    # 1. Frontend App View (serves the index.html as the main page)
-    path('', FrontendAppView.as_view(), name='frontend_app'),
-
-    # 2. Django Admin Site
-    path('admin/', admin.site.urls),
+    # This path serves your index.html at the root URL ('/')
+    path('', FrontendAppView.as_view(), name='frontend-app'),
     
-    # 3. API Authentication Endpoints
-    path('api/register/', RegisterView.as_view(), name='register'),
+    path('admin/', admin.site.urls),
+
+    # This includes all URLs from your cv_analyzer app (like /api/jobs/)
+    path('api/', include('cv_analyzer.urls')),
+
+    # Use the specific views for the token endpoints
     path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-    
-    # 4. Include all other API endpoints (for jobs, applicants, etc.) 
-    #    from the cv_analyzer app, prefixed with /api/
-    path('api/', include('cv_analyzer.urls')), 
 ]
+
+# This line is crucial for the "Download CV" button to work in development
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+

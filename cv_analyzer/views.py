@@ -1,40 +1,74 @@
-from django.shortcuts import render
-
-# Create your views here.
+import hashlib
+from .tasks import process_cv_analysis
 from django.views.generic import TemplateView
 from rest_framework import viewsets, status, generics, permissions
 from rest_framework.response import Response
-from django.db import transaction
-from .models import JobPosition, Applicant, CVAnalysis
+from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied, NotFound
+from .models import JobPosition, Applicant, CVAnalysis, QuizAttempt
 from .serializers import UserSerializer, JobPositionSerializer, ApplicantSerializer
-from .services import extract_text_from_file, analyze_cv_with_gemini
 
 class FrontendAppView(TemplateView):
-    template_name = "cv_analyzer/index.html"
+    """
+    Serves the main index.html file as the frontend application.
+    """
+    template_name = "index.html"
 
 class RegisterView(generics.CreateAPIView):
+    """
+    Allows any new user to register for an account.
+    """
     serializer_class = UserSerializer
     permission_classes = [permissions.AllowAny]
 
-class JobPositionViewSet(viewsets.ModelViewSet):
-    serializer_class = JobPositionSerializer
+class CurrentUserView(APIView):
+    """
+    Determines the current user by their token and return their data.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        serializer = UserSerializer(request.user)
+        return Response(serializer.data)
 
-    def get_queryset(self):
-        # Only show job positions created by the current logged-in user
-        return JobPosition.objects.filter(created_by=self.request.user)
+class JobPositionViewSet(viewsets.ModelViewSet):
+    """
+    Handles creating, listing, and managing Job Positions.
+    """
+    serializer_class = JobPositionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = JobPosition.objects.all().order_by('-created_at')
 
     def perform_create(self, serializer):
-        # Automatically assign the current user when a job is created
+        if not self.request.user.is_staff:
+            raise PermissionDenied("You do not have permission to create a job position.")
         serializer.save(created_by=self.request.user)
 
 class ApplicantViewSet(viewsets.ModelViewSet):
+    """
+    Handles creating, listing, and downloading Applicant CVs.
+    """
     serializer_class = ApplicantSerializer
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        # Users can only see applicants for jobs they created
-        return Applicant.objects.filter(job_position__created_by=self.request.user)
+        user = self.request.user
+        job_position_id = self.request.query_params.get('job_position')
+        # Use prefetch_related for one-to-one reverse lookups to optimize performance
+        base_queryset = Applicant.objects.all().select_related(
+            'cvanalysis', 'created_by'
+        ).prefetch_related('quizattempt')
 
-    @transaction.atomic
+        if user.is_staff:
+            queryset = base_queryset
+        else:
+            queryset = base_queryset.filter(created_by=user)
+        
+        if job_position_id:
+            queryset = queryset.filter(job_position_id=job_position_id)
+        
+        return queryset.order_by('-uploaded_at')
+
     def create(self, request, *args, **kwargs):
         job_position_id = request.data.get('job_position')
         cv_file = request.FILES.get('cv_file')
@@ -43,43 +77,93 @@ class ApplicantViewSet(viewsets.ModelViewSet):
             return Response({"error": "job_position and cv_file are required fields."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            job_position = JobPosition.objects.get(id=job_position_id, created_by=request.user)
+            job_position = JobPosition.objects.get(id=job_position_id)
         except JobPosition.DoesNotExist:
-            return Response({"error": "Job Position not found or you do not have permission."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Job Position not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Create an applicant instance first to save the file
-        applicant = Applicant.objects.create(job_position=job_position, cv_file=cv_file)
+        file_content = cv_file.read()
+        cv_hash = hashlib.sha256(file_content).hexdigest()
+        cv_file.seek(0) 
 
+        if Applicant.objects.filter(job_position=job_position, cv_hash=cv_hash).exists():
+            return Response({"error": "This CV has already been submitted for this job."}, status=status.HTTP_409_CONFLICT)
+
+        applicant = Applicant.objects.create(
+            job_position=job_position, 
+            cv_file=cv_file,
+            cv_hash=cv_hash,
+            analysis_status='PENDING',
+            created_by=request.user
+        )
+        process_cv_analysis.delay(applicant.id)
+        serializer = self.get_serializer(applicant)
+        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+class ApplicantQuizView(APIView):
+    """
+    A view to retrieve the AI-generated quiz questions for an applicant.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk, format=None):
         try:
-            # 1. Extract text from the saved file
-            cv_text = extract_text_from_file(applicant.cv_file.path)
-            if not cv_text:
-                 raise Exception("Could not extract text from the CV file. It might be empty, corrupted, or an image-based PDF.")
+            applicant = Applicant.objects.get(pk=pk)
+            analysis = CVAnalysis.objects.get(applicant=applicant)
+        except (Applicant.DoesNotExist, CVAnalysis.DoesNotExist):
+            raise NotFound("Applicant or analysis data not found.")
 
-            # 2. Call Gemini API for analysis
-            analysis_json = analyze_cv_with_gemini(cv_text, job_position.description)
-            if 'error' in analysis_json:
-                raise Exception(analysis_json.get('details', 'Unknown AI error'))
+        if not (request.user.is_staff or applicant.created_by == request.user):
+            raise PermissionDenied("You do not have permission to view this quiz.")
+        
+        if applicant.analysis_status != 'COMPLETED' or not analysis.quiz_data or 'questions' not in analysis.quiz_data:
+            return Response({"detail": "Quiz is not ready yet."}, status=status.HTTP_202_ACCEPTED)
+        
+        # Remove correct answers before sending to the user
+        quiz_for_user = analysis.quiz_data.copy()
+        for question in quiz_for_user.get('questions', []):
+            question.pop('correct_answer', None)
+            
+        return Response(quiz_for_user)
 
-            # 3. Update applicant details and create the analysis record
-            basic_info = analysis_json.get('basic_info', {})
-            applicant.full_name = basic_info.get('name', 'N/A')
-            applicant.email = basic_info.get('email', 'N/A')
-            applicant.phone = basic_info.get('phone', 'N/A')
-            applicant.save()
+class SubmitQuizView(APIView):
+    """
+    A view to submit quiz answers and calculate the score.
+    """
+    permission_classes = [permissions.IsAuthenticated]
 
-            CVAnalysis.objects.create(
-                applicant=applicant,
-                raw_text=cv_text,
-                scorecard=analysis_json,
-                summary=analysis_json.get('final_assessment', {}).get('summary', 'No summary.')
-            )
+    def post(self, request, pk, format=None):
+        try:
+            applicant = Applicant.objects.get(pk=pk)
+            analysis = CVAnalysis.objects.get(applicant=applicant)
+        except (Applicant.DoesNotExist, CVAnalysis.DoesNotExist):
+            raise NotFound("Applicant or analysis data not found.")
 
-            serializer = self.get_serializer(applicant)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        if applicant.created_by != request.user:
+            raise PermissionDenied("You cannot submit a quiz for another user.")
 
-        except Exception as e:
-            # If any step fails, the transaction.atomic block will roll back, 
-            # but we should still delete the applicant record with the file.
-            applicant.delete() 
-            return Response({"error": f"An error occurred during analysis: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if QuizAttempt.objects.filter(applicant=applicant).exists():
+            return Response({"detail": "You have already submitted this quiz."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_answers = request.data.get('answers', {})
+        correct_questions = analysis.quiz_data.get('questions', [])
+        
+        score = 0
+        total_questions = len(correct_questions)
+
+        for i, question_data in enumerate(correct_questions):
+            user_answer = user_answers.get(str(i))
+            correct_answer = question_data.get('correct_answer')
+            if user_answer and user_answer == correct_answer:
+                score += 1
+        
+        attempt = QuizAttempt.objects.create(
+            applicant=applicant,
+            answers=user_answers,
+            score=score,
+            total_questions=total_questions
+        )
+
+        return Response({
+            "score": attempt.score,
+            "total_questions": attempt.total_questions
+        }, status=status.HTTP_201_CREATED)
